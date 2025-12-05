@@ -1,0 +1,741 @@
+import time
+import json
+import re
+import requests
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import random
+
+# --- 🔑 КЛЮЧИ ---
+TELEGRAM_TOKEN = "8371316476:AAGejzQs6Au4Fq7o_g5OQ1WPEf_nV-SZgEA"
+OPENROUTER_API_KEY = "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"
+
+# --- 📋 ТЕКСТЫ ---
+WELCOME_TEXT = """👨‍🍳 <b>Добро пожаловать в Кулинарного Помощника!</b>
+
+Я помогу вам с рецептами:
+
+🍎 <b>Поиск по продуктам</b> — что у вас есть  
+🍽️ <b>Рецепт по названию</b> — название блюда
+
+Пример: <i>курица, рис, овощи</i> или <i>борщ</i>"""
+
+BOT_CAPABILITIES = """🔍 <b>ВОЗМОЖНОСТИ БОТА</b>
+
+🎯 <b>Что я умею:</b>
+• 🍳 Найти рецепт по названию блюда
+• 🥕 Создать рецепт из ваших продуктов
+• ⚡ Выдать результат за 2-5 секунд
+• 💾 Запоминать частые запросы (кэш)
+
+🤖 <b>Умные возможности:</b>
+• 🧠 AI-анализ запросов
+• ✅ Автопроверка на съедобность
+• 💡 Подсказки при ошибках
+
+🌟 <b>РАСШИРЕННЫЕ ЗАПРОСЫ:</b>
+
+<b>🎉 Для праздников:</b>
+• "Подбери блюдо на день рождения"
+• "Что приготовить на Новый год"
+• "Меню для романтического ужина"
+• "Детский праздничный стол"
+
+<b>🥗 По диетам:</b>
+• "Вегетарианские рецепты"
+• "Низкокалорийные блюда"
+• "Рецепты без глютена"
+• "Безлактозные блюда"
+
+<b>🌍 По кухням:</b>
+• "Итальянские блюда"
+• "Японская кухня рецепты"
+• "Мексиканские рецепты"
+• "Русская традиционная кухня"
+
+<b>⏱️ По времени:</b>
+• "Быстрые рецепты за 15 минут"
+• "Что приготовить на ужин быстро"
+• "Простой завтрак"
+• "Блюда для ленивых"
+
+<b>🍂 Сезонные:</b>
+• "Летние салаты"
+• "Зимние согревающие супы"
+• "Осенние блюда из тыквы"
+• "Весенние легкие рецепты"
+
+<b>💰 По бюджету:</b>
+• "Экономные рецепты"
+• "Блюда из доступных продуктов"
+• "Что приготовить из остатков"
+• "Бюджетное меню на неделю"
+
+<b>👶 По случаю:</b>
+• "Завтрак для всей семьи"
+• "Обед на работу"
+• "Ужин для двоих"
+• "Детские блюда"
+
+<b>💪 Для здоровья:</b>
+• "Полезные завтраки"
+• "Энергетические перекусы"
+• "Блюда для иммунитета"
+• "Пища для мозга"
+
+<b>🎓 По сложности:</b>
+• "Простой рецепт для начинающих"
+• "Сложное блюдо для гурманов"
+• "Пошаговый рецепт с фото"
+
+🔧 <b>КАК ПОЛЬЗОВАТЬСЯ:</b>
+1. Напишите что угодно связанное с едой
+2. Можно одним словом: "омлет", "салат"
+3. Можно список продуктов: "курица, картофель, морковь"
+4. Можно сложные запросы (см. выше примеры)
+
+<b>💡 СОВЕТ:</b> Чем конкретнее запрос - тем точнее рецепт!
+
+Примеры запросов:
+• "борщ"
+• "курица с рисом"
+• "вегетарианский ужин на двоих"
+• "быстрый завтрак за 10 минут"
+• "праздничный торт на день рождения"
+
+<b>🚫 ЧЕГО НЕ ДЕЛАЕТ БОТ:</b>
+• Не ищет несъедобные вещи
+• Не дает рецепты алкоголя
+• Не нарушает правила безопасности
+
+Начните с <b>"Что приготовить?"</b> или <b>"Рецепт..."</b> 🍽️"""
+
+# --- 📱 КЛАВИАТУРА ---
+PERSISTENT_KEYBOARD = {
+    "keyboard": [
+        ["🏠 Главное меню", "🔄 Новый запрос"],
+        ["🔍 Возможности бота"]
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": False
+}
+
+class FastCookingBot:
+    def __init__(self):
+        self.base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+        self.last_update_id = 0
+        self.openrouter_url = "https://openrouter.ai/api/v1/chat/completions"
+        self.headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://yourapp.example",
+            "X-Title": "CookingBot"
+        }
+        
+        # Кэш для быстрых ответов
+        self.recipe_cache = {}
+        self.validation_cache = {}  # Кэш проверок
+        self.max_cache_size = 50
+        
+        # Пул потоков для параллельной обработки
+        self.thread_pool = ThreadPoolExecutor(max_workers=5)
+        
+        # Быстрые ответы для частых запросов
+        self.quick_responses = {
+            "омлет": "🍳 <b>Простой омлет</b>\n\n🥕 <b>Ингредиенты:</b>\n• Яйца - 2 шт.\n• Молоко - 2 ст.л.\n• Соль - щепотка\n• Масло - 1 ч.л.\n\n👨‍🍳 <b>Приготовление:</b>\n1. Взбейте яйца с молоком и солью\n2. Разогрейте сковороду с маслом\n3. Вылейте смесь, жарьте 3-4 минуты\n\n⏱️ <b>Время:</b> 10 минут\n💡 <b>Совет:</b> Добавьте зелень для аромата",
+            "салат": "🥗 <b>Свежий салат</b>\n\n🥕 <b>Ингредиенты:</b>\n• Огурцы - 2 шт.\n• Помидоры - 2 шт.\n• Лук - 0.5 шт.\n• Масло, соль\n\n👨‍🍳 <b>Приготовление:</b>\n1. Нарежьте овощи\n2. Добавьте соль, масло\n3. Перемешайте\n\n⏱️ <b>Время:</b> 5 минут\n💡 <b>Совет:</b> Дайте постоять 5 минут",
+            "блины": "🥞 <b>Блины классические</b>\n\n🥕 <b>Ингредиенты:</b>\n• Мука - 200г\n• Молоко - 500мл\n• Яйца - 2 шт.\n• Сахар - 2 ст.л.\n• Соль - щепотка\n\n👨‍🍳 <b>Приготовление:</b>\n1. Смешайте все ингредиенты\n2. Дайте тесту постоять 15 мин\n3. Жарьте на разогретой сковороде\n\n⏱️ <b>Время:</b> 30 минут\n💡 <b>Совет:</b> Смазывайте сковороду маслом",
+            "борщ": "🍲 <b>Борщ классический</b>\n\n🥕 <b>Ингредиенты:</b>\n• Свекла - 2 шт.\n• Капуста - 300г\n• Картофель - 3 шт.\n• Морковь - 1 шт.\n• Лук - 1 шт.\n• Мясо (говядина) - 400г\n• Томатная паста - 2 ст.л.\n\n👨‍🍳 <b>Приготовление:</b>\n1. Сварите мясной бульон\n2. Нарежьте овощи\n3. Обжарьте свеклу с морковью\n4. Добавьте все в бульон\n5. Варите 30 минут\n\n⏱️ <b>Время:</b> 1.5 часа\n💡 <b>Совет:</b> Подавайте со сметаной",
+            "паста": "🍝 <b>Паста карбонара</b>\n\n🥕 <b>Ингредиенты:</b>\n• Спагетти - 200г\n• Бекон - 150г\n• Яйца - 2 шт.\n• Сыр пармезан - 50г\n• Чеснок - 2 зубчика\n• Соль, перец\n\n👨‍🍳 <b>Приготовление:</b>\n1. Отварите пасту\n2. Обжарьте бекон с чесноком\n3. Смешайте яйца с сыром\n4. Соедините все ингредиенты\n\n⏱️ <b>Время:</b> 20 минут\n💡 <b>Совет:</b> Не используйте сливки!"
+        }
+
+        # Быстрые проверки для частых запросов
+        self.quick_validation = {
+            # Очевидные пищевые запросы
+            "омлет": (True, ""),
+            "салат": (True, ""),
+            "блины": (True, ""),
+            "суп": (True, ""),
+            "борщ": (True, ""),
+            "каша": (True, ""),
+            "паста": (True, ""),
+            "пицца": (True, ""),
+            "торт": (True, ""),
+            "кофе": (True, ""),
+            "чай": (True, ""),
+            "компот": (True, ""),
+            
+            # Очевидные несъедобные предметы
+            "телефон": (False, "📱 Телефон нельзя приготовить и съесть. Я помогаю только с рецептами еды!"),
+            "компьютер": (False, "💻 Компьютер - это техника, а не еда. Попробуйте запросить рецепт из продуктов!"),
+            "машина": (False, "🚗 Машину нельзя приготовить! Я специализируюсь на кулинарных рецептах."),
+            "дерево": (False, "🌳 Дерево не съедобно! Укажите пищевые продукты для рецепта."),
+            "камень": (False, "🪨 Камни не готовят! Я помогу с рецептами из мяса, овощей, круп и других продуктов."),
+            "кирпич": (False, "🧱 Кирпич - строительный материал, а не еда! Попробуйте запросить рецепт выпечки или других блюд."),
+            "книга": (False, "📚 Книги читают, а не едят! Спросите рецепт из доступных продуктов."),
+            "мяч": (False, "⚽ Мяч - это для игры! Я могу помочь с рецептами блюд."),
+        }
+
+        # Базовые стоп-слова для быстрой проверки
+        self.stop_words = {
+            'бомба', 'оружие', 'наркотик', 'убить', 'взрыв', 'алкоголь', 'вино', 'водка', 
+            'пиво', 'коньяк', 'виски', 'ром', 'джин', 'текила', 'самогон', 'сигареты'
+        }
+
+        # Примеры валидных запросов для подсказок
+        self.valid_examples = [
+            "Рецепт курицы с картофелем",
+            "Что приготовить из яиц и помидоров",
+            "Блюдо из риса и овощей",
+            "Вегетарианский ужин на двоих",
+            "Быстрый завтрак за 10 минут",
+            "Праздничный торт на день рождения",
+            "Итальянская паста на ужин",
+            "Низкокалорийный салат",
+            "Бюджетный суп из доступных продуктов",
+            "Детские блюда для праздника",
+            "Летний освежающий напиток",
+            "Зимний согревающий суп",
+            "Осенний пирог с яблоками",
+            "Весенний легкий салат"
+        ]
+
+    def get_updates(self):
+        """Получение обновлений от Telegram"""
+        try:
+            response = requests.get(
+                f"{self.base_url}/getUpdates",
+                params={
+                    "offset": self.last_update_id + 1,
+                    "timeout": 10,
+                    "limit": 10
+                },
+                timeout=5
+            )
+            return response.json().get("result", []) if response.status_code == 200 else []
+        except:
+            return []
+
+    def send_message(self, chat_id, text, inline_buttons=None, persistent_keyboard=False):
+        """Отправка сообщений"""
+        def _send():
+            try:
+                payload = {
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
+                }
+                
+                if inline_buttons:
+                    payload["reply_markup"] = json.dumps({"inline_keyboard": inline_buttons})
+                elif persistent_keyboard:
+                    payload["reply_markup"] = json.dumps(PERSISTENT_KEYBOARD)
+                
+                requests.post(f"{self.base_url}/sendMessage", json=payload, timeout=3)
+            except:
+                pass
+        
+        threading.Thread(target=_send, daemon=True).start()
+
+    def validate_with_ai(self, user_input):
+        """Умная проверка запроса через AI"""
+        cache_key = f"validate_{user_input.lower().strip()}"
+        
+        # Проверка кэша
+        if cache_key in self.validation_cache:
+            return self.validation_cache[cache_key]
+
+        prompt = f"""Проанализируй запрос и определи, относится ли он к кулинарии, еде или приготовлению пищи.
+
+Запрос: "{user_input}"
+
+К кулинарии относятся:
+1. Названия блюд (борщ, пицца, салат)
+2. Продукты и ингредиенты (курица, помидоры, мука)
+3. Кулинарные процессы (жарить, варить, запекать)
+4. Приемы пищи (завтрак, обед, ужин)
+5. Кухни мира (итальянская, японская)
+6. Диеты и особенности питания (вегетарианское, безглютеновое)
+7. Праздничные и особые блюда
+8. Кулинарные техники и методы
+9. Кухонная утварь и оборудование
+10. Хранение и обработка продуктов
+
+Не относятся к кулинарии:
+- Техника, электроника, машины
+- Одежда, мебель, строительные материалы
+- Животные как питомцы (но как ингредиент - относятся)
+- Абстрактные концепции без связи с едой
+- Вредные и опасные вещества
+
+Ответь ТОЛЬКО в формате JSON:
+{{
+    "is_food_related": true/false,
+    "confidence": "высокая/средняя/низкая",
+    "category": "продукты/блюдо/диета/техника/другое",
+    "reason": "краткое объяснение почему да/нет",
+    "suggestion": "предложение что спросить вместо этого"
+}}"""
+
+        data = {
+            "model": "deepseek/deepseek-chat",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Ты аналитик кулинарных запросов. Будь снисходительным - если запрос МОЖЕТ относиться к еде (даже косвенно), разреши его. Сомневаешься - разреши. Отвечай ТОЛЬКО в формате JSON."
+                },
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.3,
+            "max_tokens": 200,
+            "stream": False
+        }
+
+        try:
+            response = requests.post(
+                self.openrouter_url,
+                headers=self.headers,
+                json=data,
+                timeout=4  # Быстрая проверка
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                text = result['choices'][0]['message']['content'].strip()
+                
+                # Парсинг JSON ответа
+                try:
+                    validation_data = json.loads(text)
+                    is_valid = validation_data.get("is_food_related", True)  # По умолчанию разрешаем
+                    reason = validation_data.get("reason", "")
+                    suggestion = validation_data.get("suggestion", "")
+                    
+                    result = (is_valid, reason, suggestion)
+                    
+                    # Кэшируем результат
+                    if len(self.validation_cache) >= self.max_cache_size:
+                        self.validation_cache.pop(next(iter(self.validation_cache)))
+                    self.validation_cache[cache_key] = result
+                    
+                    return result
+                    
+                except json.JSONDecodeError:
+                    # Если AI вернул не JSON, разрешаем запрос (безопасный подход)
+                    return (True, "", "Продолжаем поиск рецепта")
+                    
+            else:
+                return (True, "", "Продолжаем поиск рецепта")  # При ошибке разрешаем
+                
+        except Exception:
+            return (True, "", "Продолжаем поиск рецепта")  # При ошибке разрешаем
+
+    def smart_validation(self, text):
+        """Умная многоуровневая проверка запроса"""
+        text_lower = text.lower().strip()
+        
+        # 1. Быстрая проверка стоп-слов
+        if any(stop_word in text_lower for stop_word in self.stop_words):
+            return False, "🚫 Этот запрос содержит запрещенные слова", "Пожалуйста, укажите пищевые продукты"
+
+        # 2. Проверка на положительные ключевые слова
+        positive_keywords = [
+            'рецепт', 'блюдо', 'приготовить', 'сделать', 'приготовление',
+            'кухня', 'кулинар', 'шеф', 'повар', 'еда', 'кушать', 'поесть',
+            'завтрак', 'обед', 'ужин', 'перекус', 'десерт', 'салат', 'суп',
+            'закуска', 'выпечка', 'торт', 'пирог', 'пицца', 'паста', 'соус',
+            'маринад', 'гарнир', 'основное', 'напиток', 'коктейль', 'смузи',
+            'подбери', 'найди', 'посоветуй', 'что приготовить', 'что сделать',
+            'меню', 'блюда', 'кулинария', 'кулинарный', 'пищевой', 'продукт',
+            'ингредиент', 'приправа', 'специя', 'запечь', 'пожарить', 'сварить',
+            'тушить', 'замариновать', 'испечь', 'замесить', 'взбить', 'нарезать'
+        ]
+        
+        # Если есть явные кулинарные слова - сразу разрешаем
+        if any(keyword in text_lower for keyword in positive_keywords):
+            return True, "", ""
+        
+        # 3. Проверка по категориям продуктов
+        food_categories = [
+            'мясо', 'куриц', 'говядин', 'свинин', 'рыб', 'морепродукт',
+            'овощ', 'фрукт', 'ягод', 'злак', 'круп', 'рис', 'гречк', 'макарон',
+            'хлеб', 'мук', 'яйц', 'молок', 'сыр', 'творог', 'кефир',
+            'масло', 'специ', 'приправ', 'зелен', 'орех', 'сем', 'бобов',
+            'картош', 'морков', 'лук', 'чеснок', 'помидор', 'огурец', 'капуст',
+            'свекл', 'перец', 'баклажан', 'кабачок', 'тыкв', 'яблок', 'груш',
+            'банан', 'апельсин', 'лимон', 'клубник', 'малин', 'вишн', 'слив'
+        ]
+        
+        if any(category in text_lower for category in food_categories):
+            return True, "", ""
+        
+        # 4. Проверка быстрых ответов
+        if text_lower in self.quick_validation:
+            is_valid, message = self.quick_validation[text_lower]
+            if not is_valid:
+                return False, message, "Попробуйте запросить рецепт из продуктов питания"
+            return True, "", ""
+
+        # 5. Проверка очевидных паттернов
+        # Слишком длинные запросы (возможно, не о еде)
+        if len(text) > 100:
+            return False, "📝 Запрос слишком сложный для анализа", "Укажите конкретные продукты или название блюда"
+
+        # Запросы с числами и единицами измерения (скорее всего о еде)
+        if re.search(r'\d+\s*(г|кг|мл|л|шт|стакан|ст\.?л|ч\.?л|чаш|ложк|щепот)', text_lower):
+            return True, "", ""
+
+        # 6. AI-проверка для сложных случаев
+        is_valid, reason, suggestion = self.validate_with_ai(text)
+        
+        if not is_valid:
+            error_msg = f"🚫 {reason}" if reason else "🚫 Этот запрос не относится к кулинарии"
+            suggestion_msg = suggestion if suggestion else f"💡 Попробуйте: {self.get_suggestion()}"
+            return False, error_msg, suggestion_msg
+        
+        return True, "", ""
+
+    def get_suggestion(self):
+        """Случайный пример валидного запроса"""
+        if self.valid_examples:
+            return random.choice(self.valid_examples)
+        return "Например: 'рецепт курицы с овощами'"
+
+    def get_ai_response(self, user_input):
+        """Генерация рецептов через AI"""
+        cache_key = user_input.lower().strip()
+        
+        if cache_key in self.recipe_cache:
+            return self.recipe_cache[cache_key]
+        
+        if cache_key in self.quick_responses:
+            return self.quick_responses[cache_key]
+
+        # Определяем тип запроса для лучшего промта
+        prompt_type = self.determine_prompt_type(user_input)
+        
+        if prompt_type == "dish_name":
+            prompt = f"""Создай подробный рецепт для блюда: {user_input}
+
+Формат:
+🍳 Название блюда
+🥕 Ингредиенты списком с количествами
+👨‍🍳 Пошаговое приготовление
+⏱️ Время приготовления
+💡 Полезный совет
+🔥 Калорийность и сложность
+
+Будь подробным, но кратким. Используй эмодзи для наглядности."""
+        
+        elif prompt_type == "holiday":
+            prompt = f"""Подбери праздничное меню или блюдо для: {user_input}
+
+Формат:
+🎉 Название праздничного блюда/меню
+🥕 Необходимые ингредиенты
+👨‍🍳 Особенности приготовления
+⏱️ Общее время готовки
+💡 Советы по сервировке
+👥 На сколько персон
+
+Сделай блюдо праздничным и красивым!"""
+        
+        elif prompt_type == "diet":
+            prompt = f"""Создай рецепт с учетом диетических требований: {user_input}
+
+Формат:
+🥗 Название диетического блюда
+🥕 Ингредиенты (с указанием диетических особенностей)
+👨‍🍳 Приготовление с учетом диеты
+⏱️ Время приготовления
+💡 Польза для здоровья
+📊 Пищевая ценность (белки/жиры/углеводы)
+
+Акцент на пользе и диетических свойствах."""
+        
+        elif prompt_type == "quick":
+            prompt = f"""Придумай быстрый рецепт: {user_input}
+
+Формат:
+⚡ Быстрое название блюда
+🥕 Минимальные ингредиенты
+👨‍🍳 Сверхбыстрое приготовление
+⏱️ Время (до 30 минут максимум)
+💡 Лайфхаки для экономии времени
+
+Главное - скорость и простота!"""
+        
+        else:  # products или default
+            prompt = f"""Создай краткий рецепт для: {user_input}
+
+Формат:
+Название блюда
+Ингредиенты списком
+Краткие шаги приготовления
+Время готовки
+Полезный совет
+
+Максимально кратко и понятно:"""
+
+        data = {
+            "model": "deepseek/deepseek-chat",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Ты шеф-повар. Отвечай очень кратко, используй эмодзи. Только рецепты. Формат: название, ингредиенты списком, шаги кратко, время, совет. Не более 400 символов."
+                },
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.7,
+            "max_tokens": 350,
+            "stream": False
+        }
+
+        try:
+            response = requests.post(
+                self.openrouter_url,
+                headers=self.headers,
+                json=data,
+                timeout=6
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                text = result['choices'][0]['message']['content'].strip()
+                formatted_text = self.format_text(text)
+                
+                if len(self.recipe_cache) >= self.max_cache_size:
+                    self.recipe_cache.pop(next(iter(self.recipe_cache)))
+                self.recipe_cache[cache_key] = formatted_text
+                
+                return formatted_text
+            else:
+                return self.get_fallback_recipe(user_input)
+                
+        except Exception:
+            return self.get_fallback_recipe(user_input)
+
+    def determine_prompt_type(self, user_input):
+        """Определяет тип запроса для лучшего промта"""
+        text_lower = user_input.lower()
+        
+        # Ключевые слова для разных типов запросов
+        holiday_keywords = ['праздник', 'день рождения', 'новый год', 'романтич', 'ужин для двоих', 'гости', 'торжеств', 'юбилей']
+        diet_keywords = ['вегетариан', 'низкокалорий', 'диетич', 'без глютена', 'безлактоз', 'здоров', 'полезн', 'похуден']
+        quick_keywords = ['быстр', 'за 15', 'за 20', 'за 30', 'срочно', 'экспресс', 'минут', 'быстро', 'сразу']
+        cuisine_keywords = ['итальянск', 'японск', 'мексикан', 'русск', 'французск', 'китайск', 'грузинск', 'восточн']
+        
+        if any(keyword in text_lower for keyword in holiday_keywords):
+            return "holiday"
+        elif any(keyword in text_lower for keyword in diet_keywords):
+            return "diet"
+        elif any(keyword in text_lower for keyword in quick_keywords):
+            return "quick"
+        elif any(keyword in text_lower for keyword in cuisine_keywords):
+            return "cuisine"
+        elif len(user_input.split()) <= 3 and not any(word in text_lower for word in ['из', 'с', 'и', 'или']):
+            return "dish_name"
+        else:
+            return "products"
+
+    def get_fallback_recipe(self, user_input):
+        """Резервный рецепт при ошибках"""
+        return f"""🍳 <b>Быстрый рецепт из {user_input}</b>
+
+🥕 <b>Ингредиенты:</b>
+• {user_input}
+• Соль, перец
+• Масло растительное
+• Любимые специи
+
+👨‍🍳 <b>Приготовление:</b>
+1. Подготовьте {user_input}
+2. Обжарьте или отварите до готовности
+3. Добавьте специи по вкусу
+4. Подавайте горячим!
+
+⏱️ <b>Время:</b> 20-25 минут
+💡 <b>Совет:</b> Экспериментируйте со специями и подачей
+
+🔥 <b>Варианты:</b>
+• Можно запечь в духовке
+• Можно добавить соус
+• Можно подать с гарниром"""
+
+    def process_message(self, message):
+        """Обработка входящих сообщений"""
+        chat_id = message["chat"]["id"]
+        text = message.get("text", "").strip()
+
+        # Обработка команд
+        if text in ["/start", "/help", "🏠 Главное меню"]:
+            self.send_message(chat_id, WELCOME_TEXT, persistent_keyboard=True)
+            return
+
+        if text == "🔄 Новый запрос":
+            self.send_message(chat_id, "📝 Что готовим? Введите продукты или название блюда:", 
+                            persistent_keyboard=True)
+            return
+
+        if text == "🔍 Возможности бота":
+            self.send_message(chat_id, BOT_CAPABILITIES, persistent_keyboard=True)
+            return
+
+        if not text:
+            self.send_message(chat_id, "✍️ Напишите что приготовить...", persistent_keyboard=True)
+            return
+
+        # Умная проверка запроса
+        is_valid, error_msg, suggestion = self.smart_validation(text)
+        
+        if not is_valid:
+            full_message = error_msg
+            if suggestion:
+                full_message += f"\n\n{suggestion}"
+            self.send_message(chat_id, full_message, persistent_keyboard=True)
+            return
+
+        # Сразу отправляем сообщение о подборе рецепта
+        self.send_message(chat_id, "⚡ Подбираю рецепт...")
+
+        # Обработка рецепта в отдельном потоке
+        def process_recipe():
+            start_time = time.time()
+            ai_text = self.get_ai_response(text)
+            end_time = time.time()
+            print(f"✅ Рецепт готов за {end_time - start_time:.1f} сек")
+            
+            # Отправляем готовый рецепт
+            self.send_message(chat_id, ai_text, 
+                            inline_buttons=self.build_inline_buttons(), 
+                            persistent_keyboard=True)
+
+        self.thread_pool.submit(process_recipe)
+
+    def format_text(self, text):
+        """Форматирование текста рецепта"""
+        # Замена заголовков
+        replacements = {
+            "Ингредиенты:": "🥕 <b>Ингредиенты:</b>",
+            "Приготовление:": "👨‍🍳 <b>Приготовление:</b>",
+            "Время:": "⏱️ <b>Время:</b>",
+            "Совет:": "💡 <b>Совет:</b>",
+            "Советы:": "💡 <b>Советы:</b>",
+            "Калорийность:": "🔥 <b>Калорийность:</b>",
+            "Сложность:": "🎯 <b>Сложность:</b>",
+            "Польза:": "💪 <b>Польза:</b>",
+            "На персон:": "👥 <b>На персон:</b>",
+            "Пищевая ценность:": "📊 <b>Пищевая ценность:</b>",
+            "Шаги:": "👨‍🍳 <b>Шаги:</b>",
+            "Инструкция:": "📝 <b>Инструкция:</b>",
+            "Рецепт:": "🍳 <b>Рецепт:</b>",
+            "Особенности:": "✨ <b>Особенности:</b>",
+            "Сервировка:": "🍽️ <b>Сервировка:</b>"
+        }
+        
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        
+        # Разметка жирным
+        text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text)
+        text = re.sub(r"\*(.*?)\*", r"<i>\1</i>", text)
+        
+        # Добавление эмодзи к спискам
+        lines = text.split('\n')
+        formatted_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('•') or stripped.startswith('-') or (stripped and stripped[0].isdigit() and '.' in stripped[:3]):
+                formatted_lines.append(line)
+            else:
+                formatted_lines.append(line)
+        
+        text = '\n'.join(formatted_lines)
+        
+        # Ограничение длины
+        if len(text) > 2000:
+            text = text[:2000] + "\n\n... (рецепт сокращен для удобства)"
+        
+        return text.strip()
+
+    def build_inline_buttons(self):
+        """Создание inline-кнопок"""
+        return [[
+            {"text": "🏠 Главное меню", "callback_data": "home"},
+            {"text": "🔄 Новый рецепт", "callback_data": "restart"},
+            {"text": "🔍 Возможности", "callback_data": "capabilities"}
+        ]]
+
+    def process_callback(self, callback):
+        """Обработка callback-запросов"""
+        callback_id = callback.get("id")
+        data = callback.get("data", "")
+        message = callback.get("message", {})
+        chat_id = message["chat"]["id"]
+
+        if data == "home":
+            self.send_message(chat_id, WELCOME_TEXT, persistent_keyboard=True)
+        elif data == "restart":
+            self.send_message(chat_id, "📝 Что готовим дальше?", persistent_keyboard=True)
+        elif data == "capabilities":
+            self.send_message(chat_id, BOT_CAPABILITIES, persistent_keyboard=True)
+        
+        # Ответ на callback
+        try:
+            requests.post(f"{self.base_url}/answerCallbackQuery", 
+                         data={"callback_query_id": callback_id, "text": "✅"}, 
+                         timeout=1)
+        except:
+            pass
+
+    def run(self):
+        """Запуск бота"""
+        print("""
+⚡ УМНЫЙ КУЛИНАРНЫЙ БОТ ЗАПУЩЕН!
+        
+🎯 ОСНОВНЫЕ ФУНКЦИИ:
+• 🍳 Поиск рецептов по названию
+• 🥕 Создание рецептов из продуктов
+• 🔍 Умная проверка запросов
+• 📚 Кнопка "Возможности бота"
+        
+⏱️ ЦЕЛЬ: ответ за 2-5 секунд
+🧠 AI: DeepSeek для анализа и генерации
+        
+Теперь можно спрашивать:
+• "вегетарианский ужин"
+• "праздничное меню на НГ"
+• "быстрый завтрак за 10 минут"
+• и многое другое!
+        """)
+        
+        while True:
+            try:
+                updates = self.get_updates()
+                for update in updates:
+                    self.last_update_id = update.get("update_id", self.last_update_id)
+                    
+                    if "message" in update and "text" in update["message"]:
+                        self.process_message(update["message"])
+                    elif "callback_query" in update:
+                        self.process_callback(update["callback_query"])
+                        
+                time.sleep(0.3)
+                
+            except KeyboardInterrupt:
+                print("\n👋 Выключение бота...")
+                self.thread_pool.shutdown()
+                break
+            except Exception as e:
+                print(f"⚠️ Ошибка: {e}")
+                time.sleep(1)
+
+if __name__ == "__main__":
+    bot = FastCookingBot()
+    bot.run()
