@@ -7,8 +7,8 @@ import threading
 import random
 
 # --- 🔑 КЛЮЧИ ---
-TELEGRAM_TOKEN = "8371316476:AAGejzQs6Au4Fq7o_g5OQ1WPEf_nV-SZgEA"
-OPENROUTER_API_KEY = "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"
+TELEGRAM_TOKEN = "-"
+OPENROUTER_API_KEY = "-"
 
 # --- 📋 ТЕКСТЫ ---
 WELCOME_TEXT = """👨‍🍳 <b>Добро пожаловать в Кулинарного Помощника!</b>
@@ -738,4 +738,5 @@ class FastCookingBot:
 
 if __name__ == "__main__":
     bot = FastCookingBot()
+
     bot.run()
